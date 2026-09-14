@@ -1,139 +1,172 @@
-# Ultra-Low-Latency Execution Engine Subsystem — EVM/SVM Hybrid Architecture
+# Matching Engine
 
-A high-performance, local execution engine for EVM and SVM bytecode. Written in Rust with zero network dependencies. Executes transactions deterministically, journals state changes, and persists to SQLite.
+High-throughput, deterministic order matching engine with pre-trade risk checks, WAL persistence, and crash recovery.
 
 ## Architecture
 
-Workspace monorepo with 4 crates, each with a single responsibility:
-
 ```
-                    ┌─────────────┐
-                    │  main.rs    │  CLI entry point
-                    └──────┬──────┘
-                           │
-              ┌────────────┼────────────┐
-              │            │            │
-        ┌─────┴─────┐ ┌───┴───┐ ┌─────┴─────┐
-        │  decoder   │ │  vm   │ │  storage  │
-        │  router    │ │       │ │           │
-        └─────┬──────┘ └───┬───┘ └─────┬─────┘
-              │            │            │
-              │     ┌──────┴──────┐     │
-              │     │   journal   │     │
-              │     └─────────────┘     │
-              └─────────┬───────────────┘
-                    StateJournal
+Order → RiskEngine → MatchingEngine → OrderBook → WAL → Disk
+                       ↓
+                   SPSC Ring Buffer
+                       ↓
+                   Recovery (replay)
 ```
 
-| Layer | Crate | Purpose |
-|-------|-------|---------|
-| CLI | `vm/src/main.rs` | Parses hex input, file, or stdin. Routes to EVM or SVM. |
-| Routing | `decoder/src/router.rs` | Detects engine via 4-byte ELF magic. |
-| Execution | `vm/src/interpreter.rs`, `vm/src/svm.rs` | Stack-based EVM (~40 opcodes) and register-based SVM (~13 opcodes). |
-| State | `journal/src/lib.rs` | `StateJournal` — holds pending mutations. |
-| Persistence | `storage/src/sqlite_store.rs` | SQLite batch write via `rusqlite`. |
+### Core Components
 
-## Crates
+| Module | Purpose |
+|---|---|
+| `types` | `Symbol`, `OrderId`, `Price`, `Qty`, `Side`, `OrderType`, `TimeInForce`, `Trade` |
+| `book` | `OrderBook` — `BTreeMap<Price, PriceLevel>` with price-time priority, STP logic |
+| `risk` | `RiskEngine` — 5 pre-trade checks: notional, position, fat-finger, margin, short-sale |
+| `engine` | `MatchingEngine` — orchestrates book + risk + STP + DAY TIF expiry |
+| `registry` | `MatchingRegistry` — multi-asset routing via `HashMap<Symbol, MatchingEngine>` |
+| `wal` | `WalWriter`/`WalReader` — memory-mapped WAL with 80-byte events and CRC32 integrity |
+| `pipeline` | `SpscRing<T>` — lock-free SPSC ring buffer with cache-line padded atomics |
+| `recovery` | `Recovery::replay_wal()` — deterministic state rebuild from WAL on crash |
 
-| Crate | Type | Dependencies |
-|-------|------|-------------|
-| `decoder` | lib | `secp256k1`, `sha2`, `thiserror` |
-| `vm` | lib + bin | `primitive-types` (U256), `sha2`, `hex`, `journal`, `decoder` |
-| `journal` | lib | *(none — std only)* |
-| `storage` | lib | `rusqlite` (bundled), `thiserror` |
+## Order Types
 
-## Quick Start
+| Type | Behavior |
+|---|---|
+| `Limit` | Rests in book at limit price, matches against opposite side |
+| `Market` | Takes best available liquidity, no price limit |
+| `IOC` | Immediate-or-Cancel — fills what it can, remainder discarded |
+| `FOK` | Fill-or-Kill — entire order must fill or reject |
+| `PostOnly` | Rejects if would cross existing liquidity |
+
+## Risk Checks
+
+| Check | Description |
+|---|---|
+| Notional | Rejects if `price × qty` exceeds `max_notional` |
+| Position | Rejects if resulting position exceeds `max_position` |
+| Fat-finger | Rejects if price deviates >5% from midpoint |
+| Margin | Rejects if margin utilization exceeds 80% |
+| Short-sale | Rejects sell orders when position ≤ 0 and short-selling disabled |
+
+## Self-Trade Prevention
+
+Three policies available via `MatchingEngine::with_stp()`:
+
+- `CancelPassive` — cancels the resting order
+- `CancelAggressive` — cancels the incoming order
+- `DecrementAndCancel` — fills half, cancels both
+
+## Persistence
+
+Memory-mapped WAL with zero-copy writes:
+
+```rust
+let mut writer = WalWriter::create("exchange.wal")?;
+writer.append(WalEvent::new_insert(seq, ts, order_id, account, symbol, price, qty, side, order_type))?;
+writer.flush()?;
+```
+
+80-byte `repr(C)` events with CRC32 integrity. Auto-extends file (2x growth, 256MB cap).
+
+Batch writes for group-commit:
+
+```rust
+writer.append_batch(&events)?;       // write N events
+writer.flush_range(offset, len)?;    // single flush for batch
+```
+
+## Recovery
+
+Replay WAL to rebuild engine state after crash:
+
+```rust
+let engine = Recovery::replay_wal("exchange.wal", RiskEngine::new(config))?;
+```
+
+Handles corrupt events gracefully (skips, logs, continues).
+
+## Usage
+
+```rust
+use matching_engine::*;
+
+// Single asset
+let risk = RiskEngine::new(RiskConfig::default());
+let mut engine = MatchingEngine::new(risk);
+
+let order = Order {
+    id: OrderId(1),
+    account: AccountId(1),
+    side: Side::Bid,
+    order_type: OrderType::Limit,
+    price: Price::from_f64(100.0),
+    qty: Qty(10),
+    remaining: Qty(10),
+    tif: TimeInForce::GTC,
+    timestamp: 0,
+};
+
+match engine.submit_order(order) {
+    Ok(trades) => println!("Matched {} trades", trades.len()),
+    Err(reason) => println!("Rejected: {:?}", reason),
+}
+
+// Multi-asset
+let mut registry = MatchingRegistry::new();
+registry.register(Symbol(1), MatchingEngine::new(RiskEngine::new(RiskConfig::default())));
+registry.submit_order(Symbol(1), order)?;
+```
+
+## Performance
+
+Benchmarks on single core (release profile):
+
+| Operation | Latency |
+|---|---|
+| Insert limit order | ~263ns |
+| Match full fill | ~274ns |
+| Cancel order | ~13ns |
+| WAL mmap single write | ~810ns |
+| Full pipeline (WAL + match) | ~1.04μs |
+
+**~1 million orders/second** single-core throughput.
+
+## Benchmarking
 
 ```bash
-# Build
-cargo build --release
-
-# Execute EVM bytecode
-echo -n "600560030100" | target/release/execution-engine -e hex
-
-# Execute SVM bytecode
-echo -n "010000000500010000000300ff" | target/release/execution-engine svm:hex
-
-# Execute from file
-target/release/execution-engine path/to/bytecode.bin
+cargo bench --bench matching_bench
 ```
 
-## Supported Opcodes
-
-### EVM (~40 opcodes)
-
-Stack arithmetic: `ADD`, `SUB`, `MUL`, `DIV`, `MOD`, `EXP`, `SIGNEXTEND`
-Comparison: `LT`, `GT`, `SLT`, `SGT`, `EQ`, `ISZERO`, `AND`, `OR`, `XOR`, `NOT`, `BYTE`, `SHL`, `SHR`, `SAR`
-Stack: `PUSH1`–`PUSH32`, `POP`, `DUP1`–`DUP16`, `SWAP1`–`SWAP16`
-Memory: `MLOAD`, `MSTORE`, `MSTORE8`, `MSIZE`
-Storage: `SLOAD`, `SSTORE`
-Flow: `JUMP`, `JUMPI`, `JUMPDEST`, `STOP`, `RETURN`, `REVERT`, `INVALID`
-Crypto: `SHA3`
-Gas: `GAS`, `GASPRICE`
-
-### SVM (13 opcodes)
-
-`HALT`, `ADD`, `SUB`, `MUL`, `DIV`, `OR`, `NOT`, `SHL`, `SHR`
-`STORE`, `LOAD`, `WRITE_ACCOUNT`, `MOV_IMM`
+Benchmarks: `insert_limit_order`, `match_full_fill`, `cancel_order`, `wal_mmap_append_single`, `wal_mmap_batch_pipeline`, `wal_full_pipeline`.
 
 ## Testing
 
 ```bash
-cargo test                    # All 25 tests
-cargo test --package vm       # VM tests (11)
-cargo test --package decoder  # Decoder tests (7)
-cargo test --package journal  # Journal tests (6)
-cargo test --package storage  # Storage tests (1)
-cargo bench                   # Criterion benchmarks
+cargo test
 ```
 
-## Benchmarks
-
-| Benchmark | Operation |
-|-----------|-----------|
-| `evm_add` | PUSH + PUSH + ADD + STOP |
-| `evm_sstore` | PUSH + PUSH + SSTORE + STOP |
-| `svm_register_add` | MOV_IMM + MOV_IMM + ADD + HALT |
-| `svm_account_write` | MOV_IMM + MOV_IMM + WRITE_ACCOUNT + HALT |
-
-**Performance:** EVM ~1.65 us/op, SVM ~192 ns/op (9x faster).
+28 tests covering: match, partial fill, cancel, priority, risk rejection, STP (3 policies), L1/L2/L3 book access, multi-asset registry, DAY TIF expiry, WAL roundtrip, WAL batch, WAL extend, SPSC ring buffer, concurrent SPSC, WAL replay (insert+cancel), corrupt event handling, event counting.
 
 ## Project Structure
 
 ```
-├── Cargo.toml                # Workspace root
-├── Cargo.lock
-├── crates/
-│   ├── decoder/              # Transaction parsing + engine routing
-│   │   └── src/
-│   │       ├── lib.rs        # Re-exports
-│   │       ├── types.rs      # TxHeader (62 bytes), decode_transaction()
-│   │       ├── verify.rs     # secp256k1 ECDSA signature verification
-│   │       └── router.rs     # EngineRouter, ExecutionEngine enum
-│   ├── vm/                   # Dual interpreter + CLI
-│   │   ├── benches/engines.rs
-│   │   └── src/
-│   │       ├── lib.rs        # Re-exports + 11 unit tests
-│   │       ├── main.rs       # CLI binary
-│   │       ├── interpreter.rs # EVM execute() — ~40 opcodes
-│   │       ├── svm.rs        # SVM svm_execute() — 13 opcodes
-│   │       ├── opcodes.rs    # gas_cost() table
-│   │       └── state.rs      # ExecutionState, ExecutionError
-│   ├── journal/              # Transactional state journal
-│   │   └── src/lib.rs        # StateJournal + 6 tests
-│   └── storage/              # SQLite persistence
-│       └── src/
-│           ├── lib.rs
-│           └── sqlite_store.rs # SqliteStore + 1 test
+src/
+├── main.rs          # Entry point
+├── lib.rs           # Library crate
+├── types.rs         # Domain types
+├── book.rs          # Order book (BTreeMap)
+├── risk.rs          # Pre-trade risk engine
+├── engine.rs        # Matching engine
+├── registry.rs      # Multi-asset registry
+├── wal.rs           # Memory-mapped WAL
+├── pipeline.rs      # SPSC ring buffer
+├── recovery.rs      # WAL replay
+└── tests.rs         # Integration tests
+benches/
+└── matching_bench.rs # Criterion benchmarks
 ```
 
-## Design Principles
+## Dependencies
 
-- **No traits or dynamic dispatch** — all dispatch via `match` on enums/opcodes.
-- **No async** — synchronous, blocking execution.
-- **No serialization framework** — manual byte parsing with `from_le_bytes()`/`to_le_bytes()`.
-- **Minimal dependencies** — journal crate has zero external deps.
-- **StateJournal is the only shared mutable state** between VM and storage.
+- `memmap2` — memory-mapped file I/O
+- `criterion` (dev) — benchmarking
 
 ## License
 
